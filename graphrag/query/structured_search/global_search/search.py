@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import time
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,18 +16,12 @@ import tiktoken
 
 from graphrag.index.utils.json import clean_up_json
 from graphrag.query.context_builder.builders import GlobalContextBuilder
-from graphrag.query.context_builder.conversation_history import (
-    ConversationHistory,
-)
+from graphrag.query.context_builder.conversation_history import ConversationHistory
 from graphrag.query.llm.base import BaseLLM
 from graphrag.query.llm.text_utils import num_tokens
 from graphrag.query.structured_search.base import BaseSearch, SearchResult
-from graphrag.query.structured_search.global_search.callbacks import (
-    GlobalSearchLLMCallback,
-)
-from graphrag.query.structured_search.global_search.map_system_prompt import (
-    MAP_SYSTEM_PROMPT,
-)
+from graphrag.query.structured_search.global_search.callbacks import GlobalSearchLLMCallback
+from graphrag.query.structured_search.global_search.map_system_prompt import MAP_SYSTEM_PROMPT
 from graphrag.query.structured_search.global_search.reduce_system_prompt import (
     GENERAL_KNOWLEDGE_INSTRUCTION,
     NO_DATA_ANSWER,
@@ -45,7 +40,6 @@ DEFAULT_REDUCE_LLM_PARAMS = {
 
 log = logging.getLogger(__name__)
 
-
 @dataclass
 class GlobalSearchResult(SearchResult):
     """A GlobalSearch result."""
@@ -53,7 +47,6 @@ class GlobalSearchResult(SearchResult):
     map_responses: list[SearchResult]
     reduce_context_data: str | list[pd.DataFrame] | dict[str, pd.DataFrame]
     reduce_context_text: str | list[str] | dict[str, str]
-
 
 class GlobalSearch(BaseSearch):
     """Search orchestration for global search mode."""
@@ -95,7 +88,6 @@ class GlobalSearch(BaseSearch):
         if json_mode:
             self.map_llm_params["response_format"] = {"type": "json_object"}
         else:
-            # remove response_format key if json_mode is False
             self.map_llm_params.pop("response_format", None)
 
         self.semaphore = asyncio.Semaphore(concurrent_coroutines)
@@ -108,9 +100,7 @@ class GlobalSearch(BaseSearch):
     ) -> GlobalSearchResult:
         """
         Perform a global search.
-
         Global search mode includes two steps:
-
         - Step 1: Run parallel LLM calls on communities' short summaries to generate answer for each batch
         - Step 2: Combine the answers from step 2 to generate the final answer
         """
@@ -122,7 +112,7 @@ class GlobalSearch(BaseSearch):
 
         if self.callbacks:
             for callback in self.callbacks:
-                callback.on_map_response_start(context_chunks)  # type: ignore
+                callback.on_map_response_start(context_chunks)
         map_responses = await asyncio.gather(*[
             self._map_response_single_batch(
                 context_data=data, query=query, **self.map_llm_params
@@ -160,7 +150,6 @@ class GlobalSearch(BaseSearch):
         conversation_history: ConversationHistory | None = None,
         **kwargs: Any,
     ) -> GlobalSearchResult:
-        """Perform a global search synchronously."""
         return asyncio.run(self.asearch(query, conversation_history))
 
     async def _map_response_single_batch(
@@ -216,6 +205,7 @@ class GlobalSearch(BaseSearch):
                 prompt_tokens=num_tokens(search_prompt, self.token_encoder),
             )
 
+
     def parse_search_response(self, search_response: str) -> list[dict[str, Any]]:
         """Parse the search response json and return a list of key points.
 
@@ -228,15 +218,38 @@ class GlobalSearch(BaseSearch):
         -------
         list[dict[str, Any]]
             A list of key points, each key point is a dictionary with "answer" and "score" keys
+
+        Raises
+        ------
+        ValueError
+            If the response cannot be parsed as JSON or doesn't contain the expected structure
         """
-        parsed_elements = json.loads(search_response)["points"]
-        return [
-            {
-                "answer": element["description"],
-                "score": int(element["score"]),
-            }
-            for element in parsed_elements
-        ]
+        # Try to extract JSON from the response if it's embedded in text
+        json_match = re.search(r'\{.*\}', search_response, re.DOTALL)
+        if json_match:
+            json_str = json_match.group()
+        else:
+            json_str = search_response
+
+        try:
+            parsed_data = json.loads(json_str)
+        except json.JSONDecodeError:
+            raise ValueError("Failed to parse response as JSON")
+
+        if 'points' not in parsed_data or not isinstance(parsed_data['points'], list):
+            raise ValueError("Response JSON does not contain a 'points' list")
+
+        try:
+            return [
+                {
+                    "answer": element["description"],
+                    "score": int(element["score"]),
+                }
+                for element in parsed_data["points"]
+            ]
+        except (KeyError, ValueError) as e:
+            raise ValueError(f"Error processing points: {str(e)}")
+
 
     async def _reduce_response(
         self,
@@ -264,12 +277,11 @@ class GlobalSearch(BaseSearch):
                         "answer": element["answer"],
                         "score": element["score"],
                     })
-
             # filter response with score = 0 and rank responses by descending order of score
             filtered_key_points = [
                 point
                 for point in key_points
-                if point["score"] > 0  # type: ignore
+                if point["score"] > 0 # type: ignore
             ]
 
             if len(filtered_key_points) == 0 and not self.allow_general_knowledge:
@@ -285,8 +297,8 @@ class GlobalSearch(BaseSearch):
 
             filtered_key_points = sorted(
                 filtered_key_points,
-                key=lambda x: x["score"],  # type: ignore
-                reverse=True,  # type: ignore
+                key=lambda x: x["score"], # type: ignore
+                reverse=True, # type: ignore
             )
 
             data = []
@@ -297,9 +309,9 @@ class GlobalSearch(BaseSearch):
                     f'----Analyst {point["analyst"] + 1}----'
                 )
                 formatted_response_data.append(
-                    f'Importance Score: {point["score"]}'  # type: ignore
+                    f'Importance Score: {point["score"]}'
                 )
-                formatted_response_data.append(point["answer"])  # type: ignore
+                formatted_response_data.append(point["answer"]) # type: ignore
                 formatted_response_text = "\n".join(formatted_response_data)
                 if (
                     total_tokens
@@ -324,8 +336,8 @@ class GlobalSearch(BaseSearch):
             search_response = await self.llm.agenerate(
                 search_messages,
                 streaming=True,
-                callbacks=self.callbacks,  # type: ignore
-                **llm_kwargs,  # type: ignore
+                callbacks=self.callbacks, # type: ignore
+                **llm_kwargs, # type: ignore
             )
             return SearchResult(
                 response=search_response,
